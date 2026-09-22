@@ -154,6 +154,8 @@ end
 
 local BANKS        = nil
 local weight_cache = {}
+local mat_cache    = {}
+local weight_missing = {}
 
 local function initBanks()
     if BANKS then return end
@@ -178,6 +180,7 @@ end
 
 local function getFlat(name)
     if weight_cache[name] then return weight_cache[name] end
+    if weight_missing[name] then return nil end
     initBanks()
 
     -- Dequantize weight chunk
@@ -253,20 +256,48 @@ local function getFlat(name)
         end
     end
 
-    logE('LOADER', 'NOT FOUND: '..name)
+    weight_missing[name] = true
+    if not name:match('bias$') then
+        logE('LOADER', 'NOT FOUND: '..name)
+    end
     return nil
 end
 
 local function getMat(name, rows, cols)
+    local ck = name..'#'..rows..'x'..cols
+    if mat_cache[ck] then return mat_cache[ck] end
     local flat = getFlat(name)
     if not flat then return nil end
     local mat = {}
     for r = 1, rows do
-        mat[r] = {}
+        local row = {}
         local base = (r-1)*cols
-        for c = 1, cols do mat[r][c] = flat[base+c] or 0 end
+        for c = 1, cols do row[c] = flat[base+c] or 0 end
+        mat[r] = row
     end
+    mat_cache[ck] = mat
     return mat
+end
+
+local function preloadMatrices()
+    if not cfg then return end
+    local D, F, L = cfg.embed_dim, cfg.ffn_dim, cfg.n_layers
+    local KVH = cfg.n_kv_heads
+    local HD  = math.floor(D / cfg.n_heads)
+    for li = 0, L-1 do
+        getMat('blocks_'..li..'_attn_wq_weight', D,      D)
+        getMat('blocks_'..li..'_attn_wk_weight', KVH*HD, D)
+        getMat('blocks_'..li..'_attn_wv_weight', KVH*HD, D)
+        getMat('blocks_'..li..'_attn_wo_weight', D,      D)
+        getMat('blocks_'..li..'_ffn_w1_weight',  F, D)
+        getMat('blocks_'..li..'_ffn_w2_weight',  D, F)
+        getMat('blocks_'..li..'_ffn_w3_weight',  F, D)
+        getFlat('blocks_'..li..'_norm1_weight')
+        getFlat('blocks_'..li..'_norm2_weight')
+    end
+    getFlat('norm_weight')
+    getEmb()
+    logI('LOADER', 'mat_cache preload OK: '..tostring((function() local c=0 for _ in pairs(mat_cache) do c=c+1 end return c end)())..' mats')
 end
 
 -- PHAN 3: CAC CONG THUC TOAN HOC
@@ -347,6 +378,14 @@ end
 
 -- PHAN 4: INFERENCE
 
+local function sample_greedy(logits, n)
+    local best, bi = logits[1], 1
+    for i = 2, n do
+        if logits[i] > best then best, bi = logits[i], i end
+    end
+    return bi
+end
+
 local cfg      = nil
 local emb_flat = nil
 
@@ -390,7 +429,6 @@ local function getRope(li)
 end
 
 local function applyRope(x, pos, rope)
-    -- rotate_half
     local HD   = rope.HD
     local half = math.floor(HD/2)
     local cos  = rope.cos
@@ -520,10 +558,100 @@ local function block(xs, li)
     return res
 end
 
+-- PHAN 4b: KV-CACHE
+local kv_cache = {}
+
+local function kv_reset() kv_cache = {} end
+
+local function attn_step(x, li, pos)
+    local D   = cfg.embed_dim
+    local H   = cfg.n_heads
+    local KVH = cfg.n_kv_heads
+    local HD  = math.floor(D/H)
+    local p   = 'blocks_'..li..'_attn_'
+    local wq  = getMat(p..'wq_weight', D,      D)
+    local wk  = getMat(p..'wk_weight', KVH*HD, D)
+    local wv  = getMat(p..'wv_weight', KVH*HD, D)
+    local wo  = getMat(p..'wo_weight', D,      D)
+    if not wq or not wk or not wv or not wo then return nil end
+
+    local rope = getRope(li)
+    local sc   = 1.0 / math.sqrt(HD)
+
+    local qf = matvec(wq, x, D,      D)
+    local kf = matvec(wk, x, KVH*HD, D)
+    local vf = matvec(wv, x, KVH*HD, D)
+
+    local q = {}
+    for h = 1, H do
+        local hs = (h-1)*HD+1
+        local qh = {}
+        for d = 1, HD do qh[d] = qf[hs+d-1] end
+        local qr = applyRope(qh, pos, rope)
+        for d = 1, HD do q[hs+d-1] = qr[d] end
+    end
+    local k = {}
+    for h = 1, KVH do
+        local hs = (h-1)*HD+1
+        local kh = {}
+        for d = 1, HD do kh[d] = kf[hs+d-1] end
+        local kr = applyRope(kh, pos, rope)
+        for d = 1, HD do k[hs+d-1] = kr[d] end
+    end
+
+    local c = kv_cache[li]
+    if not c then c = {K={}, V={}, len=0}; kv_cache[li] = c end
+    c.len = c.len + 1
+    c.K[c.len] = k
+    c.V[c.len] = vf
+
+    local out = {}
+    for d = 1, D do out[d] = 0 end
+    for h = 1, H do
+        local kvh    = math.floor((h-1)*KVH/H) + 1
+        local hstart = (h-1)*HD + 1
+        local kstart = (kvh-1)*HD + 1
+        local qh = {}
+        for d = 1, HD do qh[d] = q[hstart+d-1] end
+        local scores = {}
+        for s = 1, c.len do
+            local dot = 0
+            local Ks = c.K[s]
+            for d = 1, HD do dot = dot + qh[d]*Ks[kstart+d-1] end
+            scores[s] = dot * sc
+        end
+        local a = softmax(scores, c.len)
+        for s = 1, c.len do
+            local w = a[s]
+            local Vs = c.V[s]
+            for d = 1, HD do
+                out[hstart+d-1] = out[hstart+d-1] + w*Vs[kstart+d-1]
+            end
+        end
+    end
+    return matvec(wo, out, D, D)
+end
+
+local function block_step(x, li, pos)
+    local D = cfg.embed_dim
+    local p = 'blocks_'..li..'_'
+    local n1w = getFlat(p..'norm1_weight')
+    local n1b = getFlat(p..'norm1_bias')
+    local n2w = getFlat(p..'norm2_weight')
+    local n2b = getFlat(p..'norm2_bias')
+    if not n1w or not n2w then return nil end
+    local n1 = n1b and layernorm(x,n1w,n1b,D) or rmsnorm(x,n1w,D)
+    local ao = attn_step(n1, li, pos)
+    if not ao then return nil end
+    local h1 = addv(x, ao, D)
+    local n2 = n2b and layernorm(h1,n2w,n2b,D) or rmsnorm(h1,n2w,D)
+    return addv(h1, ffn(n2, li), D)
+end
+
 -- PHAN 5: GENERATE
 
 local g_history    = {}
-local MAX_HISTORY  = 2
+local MAX_HISTORY  = 1
 
 local function generate_async(input_ids, max_new, tok_ref)
     max_new = max_new or 30
@@ -543,7 +671,6 @@ local function generate_async(input_ids, max_new, tok_ref)
     local emb = getEmb()
     if not emb then logE('GEN','emb nil'); return 'loi he thong' end
 
-    -- Gom history + input
     local tokens = {}
     for _, entry in ipairs(g_history) do
         for _, id in ipairs(entry) do tokens[#tokens+1] = id end
@@ -557,22 +684,20 @@ local function generate_async(input_ids, max_new, tok_ref)
 
     local input_len = #tokens
 
-    for step = 1, max_new do
-        local ts    = getTime()
-        local start = math.max(1, #tokens-CTX+1)
-        local ctx   = {}
-        for i = start, #tokens do ctx[#ctx+1] = tokens[i] end
-
-        local xs = {}
-        for _, tid in ipairs(ctx) do xs[#xs+1] = embedToken(tid) end
-        coroutine.yield()
-
-        for l = 0, L-1 do
-            xs = block(xs, l)
-            coroutine.yield()
+    kv_reset()
+    local last_h = nil
+    local function prefill()
+        for t = 1, #tokens do
+            local h = embedToken(tokens[t])
+            for l = 0, L-1 do h = block_step(h, l, t) end
+            if t == #tokens then last_h = h end
+            if t % 8 == 0 then coroutine.yield() end
         end
+    end
+    prefill()
 
-        local last = nb and layernorm(xs[#xs],nw,nb,D) or rmsnorm(xs[#xs],nw,D)
+    for step = 1, max_new do
+        local last = nb and layernorm(last_h,nw,nb,D) or rmsnorm(last_h,nw,D)
 
         -- Tinh logits (tied embeddings)
         local logits = {}
@@ -583,7 +708,6 @@ local function generate_async(input_ids, max_new, tok_ref)
             logits[v+1] = dot
         end
 
-        -- Repetition penalty nhe
         local win = math.max(1, #tokens-6+1)
         for i = win, #tokens do
             local tid = tokens[i]
@@ -592,14 +716,17 @@ local function generate_async(input_ids, max_new, tok_ref)
             end
         end
 
-        local nid = sample_topk(logits, V, g_temperature, 15) - 1
+        local nid
+        if g_fast then
+            nid = sample_greedy(logits, V) - 1
+        else
+            nid = sample_topk(logits, V, g_temperature, 15) - 1
+        end
         tokens[#tokens+1] = nid
-        coroutine.yield()
 
         if nid == tok_ref.EOS or nid == tok_ref.PAD then break end
 
-        -- Early stop neu lap lien tiep
-        if step >= 4 then
+        if step >= 3 then
             local last_tok = tokens[#tokens]
             local rep = 0
             for i = #tokens-3, #tokens do
@@ -607,6 +734,19 @@ local function generate_async(input_ids, max_new, tok_ref)
             end
             if rep >= 4 then break end
         end
+
+        if #tokens > CTX then
+            local trim = {}
+            for i = #tokens-CTX+1, #tokens do trim[#trim+1] = tokens[i] end
+            tokens = trim
+            kv_reset()
+            prefill()
+        else
+            local h = embedToken(nid)
+            for l = 0, L-1 do h = block_step(h, l, #tokens) end
+            last_h = h
+        end
+        coroutine.yield()
     end
 
     logI('GEN', 'done '..elapsed(t0))
@@ -619,7 +759,6 @@ local function generate_async(input_ids, max_new, tok_ref)
         resp = 'xin loi minh chua hieu cau hoi nay ban oi'
     end
 
-    -- Luu history
     local entry = {}
     for _, id in ipairs(input_ids)  do entry[#entry+1] = id end
     for _, id in ipairs(answer_ids) do entry[#entry+1] = id end
@@ -637,6 +776,7 @@ local g_ready       = false
 g_busy              = false
 g_coroutine         = nil
 g_temperature       = 0.7
+g_fast              = true
 
 local function chat(msg)
     Chat:sendSystemMsg('[MiniGPT] '..tostring(msg))
@@ -663,6 +803,7 @@ local function initAI()
     end
 
     getEmb()
+    preloadMatrices()
     g_history = {}
     g_ready   = true
     g_busy    = false
@@ -678,35 +819,34 @@ local function onChat(e)
     local input = msg:sub(5):match('^%s*(.-)%s*$')
     if input == '' then chat('Dung: !ai [cau hoi]'); return end
 
-    -- Lenh he thong
     if input == 'init'      then initAI(); return end
     if input == 'reset'     then
         g_ready=false; g_tok=nil; emb_flat=nil
-        weight_cache={}; BANKS=nil; rope_cache={}
+        weight_cache={}; mat_cache={}; weight_missing={}; kv_reset(); BANKS=nil; rope_cache={}
         g_coroutine=nil; g_busy=false; g_history={}
         chat('Da reset.'); return
     end
     if input == 'clear'     then g_history={}; chat('Da xoa lich su.'); return end
     if input == 'help'      then
-        chat('Lenh: init | reset | clear | help | temp low/mid/high | log debug/info/off')
+        chat('Lenh: init | reset | clear | help | nhanh | chuan | temp low/mid/high | log debug/info/off')
+        chat('nhanh = greedy 1 vong, max 16 token (mac dinh, toc do). chuan = topk cu, cham hon.')
         chat('Debug: !ai debug [cau hoi] — in token IDs va ket qua generate')
         return
     end
+    if input == 'nhanh'     then g_fast=true;  chat('Che do: nhanh (greedy, max 16)'); return end
+    if input == 'chuan'     then g_fast=false; chat('Che do: chuan (topk-15, max 16)'); return end
 
-    -- Lenh debug
     if input:sub(1,6) == 'debug ' then
         if not g_ready then chat('Chua init. Dung "!ai init" truoc.'); return end
         local q = input:sub(7):match('^%s*(.-)%s*$')
         if q == '' then chat('Dung: !ai debug [cau hoi]'); return end
 
-        -- In token IDs cua cau hoi
         local ids = g_tok:encodeQ(q)
         local id_strs = {}
         for _, id in ipairs(ids) do id_strs[#id_strs+1] = tostring(id) end
         chat(string.format('[DBG] encodeQ("%s")', q))
         chat('[DBG] IDs: '..table.concat(id_strs, ','))
 
-        -- In tokens tuong ung
         local tok_strs = {}
         for _, id in ipairs(ids) do
             local t = g_tok.inv_vocab[id]
@@ -746,7 +886,7 @@ local function onChat(e)
             local input_len = #tokens
 
             local generated = {}
-            for step = 1, 20 do
+            for step = 1, 12 do
                 local start = math.max(1, #tokens-CTX+1)
                 local ctx = {}
                 for i = start, #tokens do ctx[#ctx+1] = tokens[i] end
@@ -765,15 +905,16 @@ local function onChat(e)
                     logits[v+1] = dot
                 end
 
-                -- Ap dung in top-5 tokens co xac suat cao nhat
-                local top = {}
-                for v = 1, V do top[#top+1] = {v-1, logits[v]} end
-                table.sort(top, function(a,b) return a[2] > b[2] end)
                 local top5 = {}
-                for i = 1, math.min(5, #top) do
-                    local tid  = top[i][1]
-                    local tstr = tok_ref.inv_vocab[tid] or ('id'..tid)
-                    top5[#top5+1] = string.format('%s(%.2f)', tstr, top[i][2])
+                local used = {}
+                for k = 1, math.min(5, V) do
+                    local bi, bv = 1, logits[1]
+                    for v = 2, V do
+                        if not used[v] and logits[v] > bv then bi, bv = v, logits[v] end
+                    end
+                    used[bi] = true
+                    local tstr = tok_ref.inv_vocab[bi-1] or ('id'..(bi-1))
+                    top5[#top5+1] = string.format('%s(%.2f)', tstr, bv)
                 end
                 chat(string.format('[DBG] step%d top5: %s', step, table.concat(top5, ' | ')))
 
@@ -792,7 +933,6 @@ local function onChat(e)
 
             chat('[DBG] Generated IDs: '..table.concat(generated, ' '))
 
-            -- Decode ket qua
             local answer_ids = {}
             for i = input_len+1, #tokens do answer_ids[#answer_ids+1] = tokens[i] end
             local resp = tok_ref:decodeAnswer(answer_ids)
@@ -808,7 +948,6 @@ local function onChat(e)
     if input == 'temp mid'  then g_temperature=0.7; chat('Temp: 0.7'); return end
     if input == 'temp high' then g_temperature=0.9; chat('Temp: 0.9'); return end
 
-    -- Tinh toan co ban
     if input:sub(1,5) == 'tinh ' then
         local expr = input:sub(6):gsub('[xX]','*')
         local ok, result = pcall(function()
@@ -832,7 +971,7 @@ local function onChat(e)
     local input_ids = ids
     local tok_ref   = g_tok
     g_coroutine = coroutine.create(function()
-        local ok, result = pcall(generate_async, input_ids, 30, tok_ref)
+        local ok, result = pcall(generate_async, input_ids, 16, tok_ref)
         if ok then
             chat('AI: '..tostring(result))
         else
@@ -843,7 +982,7 @@ local function onChat(e)
     end)
 end
 
--- PHAN 7: EVENTS + TICK (giup do lag hon)
+-- PHAN 7: EVENTS + TICK
 
 ScriptSupportEvent:registerEvent([=[Player.NewInputContent]=], onChat)
 ScriptSupportEvent:registerEvent([=[Game.Start]=], function()
